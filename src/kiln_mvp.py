@@ -53,6 +53,10 @@ CHEMISTRY_COLUMNS = [
 
 CHEMISTRY_EXPLANATION_COLUMNS = ["出磨生料KH", "出磨生料SM", "出磨生料IM"]
 
+INLET_CHEMISTRY_COLUMNS = ["入窑生料KH", "入窑生料SM", "入窑生料IM"]
+
+TIME_ANCHOR_COLUMNS = ["bucket_start", "bucket_end", "prediction_time"]
+
 PROCESS_COLUMNS = [
     "二次风温",
     "三次风温",
@@ -107,9 +111,46 @@ FORBIDDEN_FEATURE_FIELDS = [
 
 READ_COLUMNS = list(
     dict.fromkeys(
-        ["time"] + CHEMISTRY_COLUMNS + CHEMISTRY_EXPLANATION_COLUMNS + PROCESS_COLUMNS + LABEL_COLUMNS
+        ["time"]
+        + CHEMISTRY_COLUMNS
+        + CHEMISTRY_EXPLANATION_COLUMNS
+        + INLET_CHEMISTRY_COLUMNS
+        + PROCESS_COLUMNS
+        + LABEL_COLUMNS
     )
 )
+
+FEATURE_DELAY_GROUPS = {
+    "outmill_chemistry": set(CHEMISTRY_EXPLANATION_COLUMNS)
+    | {"material_cluster", "material_cluster_distance"},
+    "preheater_calciner_kiln": {
+        "二次风温",
+        "三次风温",
+        "分解炉出口温度A",
+        "分解炉出口温度B",
+        "窑主传电流",
+        "预热器出口O2含量",
+        "分解炉出口CO含量",
+        "预热器出口压力",
+        "窑喂料量反馈值",
+        "分解炉喂煤量反馈值",
+        "窑速度反馈值",
+        "高温风机反馈值",
+    },
+    "kiln_head_grate_cooler": {
+        "窑头喂煤量反馈值",
+        "窑头排风机转速反馈值",
+        "篦冷机层压",
+        "篦冷机速度反馈值",
+    },
+    "lab_release": {"previous_fcao"},
+}
+
+DEFAULT_FCAO_DELAY_CANDIDATES = {
+    "outmill_chemistry": [0, 30, 60, 90, 120, 180, 240, 300, 360, 450],
+    "preheater_calciner_kiln": [0, 15, 30, 45, 60, 90, 120],
+    "kiln_head_grate_cooler": [0, 15, 30, 45, 60, 90, 120],
+}
 
 PROCESS_RANGES = {
     "二次风温": (0.0, 1400.0),
@@ -155,6 +196,48 @@ def clean_batch(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def add_minute_time_anchors(result: pd.DataFrame) -> pd.DataFrame:
+    """Attach explicit bucket and prediction timestamps to minute aggregates.
+
+    A bucket is the half-open interval ``[bucket_start, bucket_end)``.  Its
+    process mean becomes usable only at ``bucket_end``; that instant is the
+    ``prediction_time`` used as the time-series index and as the origin for
+    every future target window.
+    """
+    result = result.copy()
+    bucket_start = pd.DatetimeIndex(result.index)
+    bucket_end = bucket_start + pd.Timedelta(minutes=1)
+    prediction_time = bucket_end
+    result["bucket_start"] = bucket_start
+    result["bucket_end"] = bucket_end
+    result["prediction_time"] = prediction_time
+    result.index = pd.DatetimeIndex(prediction_time, name="prediction_time")
+    return result
+
+
+def assert_minute_time_contract(minute: pd.DataFrame) -> None:
+    """Validate bucket anchors and prevent use of a bucket before its end."""
+    missing = sorted(set(TIME_ANCHOR_COLUMNS) - set(minute.columns))
+    if missing:
+        raise AssertionError(f"一分钟数据缺少时间锚点: {missing}")
+    prediction = pd.DatetimeIndex(minute.index)
+    if prediction.name != "prediction_time":
+        raise AssertionError("一分钟数据索引必须是 prediction_time")
+    for column in TIME_ANCHOR_COLUMNS:
+        values = pd.DatetimeIndex(pd.to_datetime(minute[column]))
+        if not values.equals(pd.DatetimeIndex(values).sort_values()):
+            raise AssertionError(f"时间锚点未按时间排序: {column}")
+    bucket_start = pd.DatetimeIndex(pd.to_datetime(minute["bucket_start"]))
+    bucket_end = pd.DatetimeIndex(pd.to_datetime(minute["bucket_end"]))
+    prediction_values = pd.DatetimeIndex(pd.to_datetime(minute["prediction_time"]))
+    if not prediction.equals(prediction_values):
+        raise AssertionError("prediction_time 必须与一分钟数据索引完全一致")
+    if not (bucket_end == bucket_start + pd.Timedelta(minutes=1)).all():
+        raise AssertionError("bucket_end 必须等于 bucket_start 加 1 分钟")
+    if not (prediction_values == bucket_end).all():
+        raise AssertionError("prediction_time 必须等于 bucket_end")
+
+
 def aggregate_complete_minutes(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -163,8 +246,8 @@ def aggregate_complete_minutes(frame: pd.DataFrame) -> pd.DataFrame:
     last_columns = set(CHEMISTRY_COLUMNS + CHEMISTRY_EXPLANATION_COLUMNS + LABEL_COLUMNS)
     agg = {column: ("last" if column in last_columns else "mean") for column in READ_COLUMNS if column != "time"}
     result = frame.groupby("minute", sort=True).agg(agg)
-    result.index.name = "time"
-    return result
+    result.index.name = "bucket_start"
+    return add_minute_time_anchors(result)
 
 
 def build_minute_cache(data_path: Path, cache_path: Path) -> pd.DataFrame:
@@ -204,10 +287,16 @@ def build_minute_cache(data_path: Path, cache_path: Path) -> pd.DataFrame:
 def load_or_build_minutes(cfg: dict[str, Any], output_dir: Path) -> pd.DataFrame:
     cache = output_dir / "minute_cache.parquet"
     if cfg.get("reuse_minute_cache", True) and cache.exists():
-        print(f"复用一分钟缓存: {cache}")
-        return pd.read_parquet(cache)
+        cached = pd.read_parquet(cache)
+        if set(TIME_ANCHOR_COLUMNS).issubset(cached.columns) and cached.index.name == "prediction_time":
+            print(f"复用一分钟缓存: {cache}")
+            assert_minute_time_contract(cached)
+            return cached
+        print(f"缓存缺少阶段 A2 时间锚点，重新构建: {cache}")
     print("读取原始 Parquet 并建立一分钟缓存……")
-    return build_minute_cache(Path(cfg["data_path"]), cache)
+    minute = build_minute_cache(Path(cfg["data_path"]), cache)
+    assert_minute_time_contract(minute)
+    return minute
 
 
 def stable_mask(frame: pd.DataFrame) -> pd.Series:
@@ -219,11 +308,11 @@ def stable_mask(frame: pd.DataFrame) -> pd.Series:
     )
 
 
-def fit_material_clusters(
-    minute: pd.DataFrame, cfg: dict[str, Any], output_dir: Path, fit_end: pd.Timestamp
-) -> tuple[pd.Series, pd.Series, dict[str, Any]]:
-    # Forward filling is causal; the imputer/scaler/K-Means fit is restricted to
-    # the training period so no test chemistry can affect cluster identities.
+def fit_material_cluster_components(
+    minute: pd.DataFrame, cfg: dict[str, Any], fit_end: pd.Timestamp
+) -> tuple[SimpleImputer, RobustScaler, KMeans, pd.DataFrame, dict[str, Any]]:
+    """Fit the chemistry transformation and K-Means strictly before ``fit_end``."""
+    assert_minute_time_contract(minute)
     causal_chemistry = minute[CHEMISTRY_COLUMNS].ffill()
     observed = causal_chemistry.notna().all(axis=1)
     changed = observed & causal_chemistry.ne(causal_chemistry.shift()).any(axis=1)
@@ -248,7 +337,28 @@ def fit_material_clusters(
         raise ValueError("训练期事件不足以覆盖配置的聚类数范围")
     best_k = max(scores, key=scores.get)
     model = fitted[best_k]
+    meta = {
+        "selected_k": int(best_k),
+        "silhouette_by_k": {str(k): value for k, value in scores.items()},
+        "chemistry_change_events": int(len(fit_events)),
+        "fit_start": str(fit_events.index.min()),
+        "fit_end": str(fit_end),
+        "fit_rows": int(len(fit_events)),
+        "missing_handling": "causal_ffill_then_training_period_median_imputer",
+        "scaler_fit_period": "training_only_before_fold_test_start_minus_purge",
+        "pca": None,
+        "cluster_centers_fit_period": "training_only_before_fold_test_start_minus_purge",
+        "future_fill_used": False,
+    }
+    return imputer, scaler, model, fit_events, meta
 
+
+def fit_material_clusters(
+    minute: pd.DataFrame, cfg: dict[str, Any], output_dir: Path, fit_end: pd.Timestamp
+) -> tuple[pd.Series, pd.Series, dict[str, Any]]:
+    imputer, scaler, model, fit_events, meta = fit_material_cluster_components(minute, cfg, fit_end)
+
+    causal_chemistry = minute[CHEMISTRY_COLUMNS].ffill()
     transformed = scaler.transform(imputer.transform(causal_chemistry))
     cluster = pd.Series(model.predict(transformed), index=minute.index, name="material_cluster")
     distance = pd.Series(
@@ -269,20 +379,25 @@ def fit_material_clusters(
         },
         output_dir / "models" / "material_cluster.joblib",
     )
-    meta = {
-        "selected_k": int(best_k),
-        "silhouette_by_k": {str(k): value for k, value in scores.items()},
-        "chemistry_change_events": int(len(fit_events)),
-        "fit_start": str(fit_events.index.min()),
-        "fit_end": str(fit_end),
-        "fit_rows": int(len(fit_events)),
-        "missing_handling": "causal_ffill_then_training_period_median_imputer",
-        "scaler_fit_period": "training_only",
-        "pca": None,
-        "cluster_centers_fit_period": "training_only",
-        "future_fill_used": False,
-    }
     return cluster, distance, meta
+
+
+def build_fold_features(
+    minute: pd.DataFrame, cfg: dict[str, Any], fit_end: pd.Timestamp
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build a fold's features after fitting clustering only on its training period."""
+    imputer, scaler, model, fit_events, meta = fit_material_cluster_components(minute, cfg, fit_end)
+    causal_chemistry = minute[CHEMISTRY_COLUMNS].ffill()
+    transformed = scaler.transform(imputer.transform(causal_chemistry))
+    cluster = pd.Series(model.predict(transformed), index=minute.index, name="material_cluster")
+    distance = pd.Series(
+        np.min(model.transform(transformed), axis=1),
+        index=minute.index,
+        name="material_cluster_distance",
+    )
+    features = build_features(minute, cluster, distance, cfg["feature_windows_minutes"])
+    meta = {**meta, "fold_feature_fit": True}
+    return features, meta
 
 
 def build_features(
@@ -306,6 +421,21 @@ def build_features(
     frame["material_cluster"] = cluster.astype("float32")
     frame["material_cluster_distance"] = distance.astype("float32")
     return frame
+
+
+def make_rolling_feature_factory(
+    minute: pd.DataFrame, cfg: dict[str, Any]
+) -> Any:
+    """Cache one causally fitted cluster feature frame per rolling-fold cutoff."""
+    cache: dict[pd.Timestamp, tuple[pd.DataFrame, dict[str, Any]]] = {}
+
+    def factory(fit_end: pd.Timestamp) -> tuple[pd.DataFrame, dict[str, Any]]:
+        key = pd.Timestamp(fit_end)
+        if key not in cache:
+            cache[key] = build_fold_features(minute, cfg, key)
+        return cache[key]
+
+    return factory
 
 
 def chronological_split(index: pd.Index) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -398,11 +528,20 @@ def future_window_aggregate(
 ) -> pd.Series:
     """Return an explicitly forward-looking target without changing input order.
 
-    Reversing a shifted series makes the rolling operation cover t+start through
-    t+end.  ``min_periods`` equal to the window width prevents partial targets.
+    The index is the explicit ``prediction_time`` axis.  Reversing a shifted
+    series therefore covers ``prediction_time + start`` through
+    ``prediction_time + end``.  ``min_periods`` equal to the window width
+    prevents partial targets.
     """
     if start_minutes < 0 or end_minutes < start_minutes:
         raise ValueError("future window must satisfy 0 <= start <= end")
+    index = pd.DatetimeIndex(series.index)
+    if index.name != "prediction_time":
+        raise ValueError("future window must be indexed by prediction_time")
+    if not index.is_monotonic_increasing or index.has_duplicates:
+        raise ValueError("future window requires a sorted unique prediction_time index")
+    if len(index) > 1 and not (index.to_series().diff().dropna() == pd.Timedelta(minutes=1)).all():
+        raise ValueError("future window requires complete one-minute prediction_time records")
     width = end_minutes - start_minutes + 1
     shifted = series.shift(-start_minutes)
     reverse = shifted.iloc[::-1]
@@ -418,11 +557,217 @@ def future_window_aggregate(
     return result.iloc[::-1].rename(series.name)
 
 
+def future_window_all_valid(
+    valid: pd.Series, start_minutes: int, end_minutes: int
+) -> pd.Series:
+    """Return whether every minute in a future window is valid."""
+    if start_minutes < 0 or end_minutes < start_minutes:
+        raise ValueError("future window must satisfy 0 <= start <= end")
+    if pd.DatetimeIndex(valid.index).name != "prediction_time":
+        raise ValueError("future validity window must be indexed by prediction_time")
+    values = valid.astype(bool).shift(-start_minutes)
+    width = end_minutes - start_minutes + 1
+    result = values.iloc[::-1].rolling(width, min_periods=width).min().iloc[::-1]
+    return result.eq(1).rename(valid.name)
+
+
 def extract_change_events(series: pd.Series) -> pd.Series:
     """Keep the first observed value and subsequent actual value changes only."""
     previous = series.shift()
     event_mask = series.notna() & (previous.isna() | series.ne(previous))
     return series.loc[event_mask]
+
+
+def build_fcao_event_table(
+    minute: pd.DataFrame, prediction_horizon_minutes: int
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build one row per actual assay-value change with conservative timing."""
+    fcao = minute["出窑熟料游离钙"]
+    event_series = extract_change_events(fcao)
+    result_times = pd.DatetimeIndex(event_series.index)
+    prediction_times = result_times - pd.Timedelta(minutes=prediction_horizon_minutes)
+    events = pd.DataFrame(
+        {
+            "fcao": event_series.to_numpy(dtype=float),
+            "target_event_time": result_times,
+            "historian_observation_time": result_times,
+            "process_production_time": pd.NaT,
+            "sample_time": pd.NaT,
+            "laboratory_result_available_time": pd.NaT,
+        },
+        index=pd.DatetimeIndex(prediction_times, name="prediction_time"),
+    )
+    if events.index.has_duplicates:
+        raise AssertionError("游离钙事件的 prediction_time 不唯一")
+    event_values = event_series.to_numpy(dtype=float)
+    immediate_prior_positions = np.arange(len(result_times)) - 1
+    immediate_prior_times = pd.Series(pd.NaT, index=events.index, dtype="datetime64[ns]")
+    immediate_prior_values = np.full(len(events), np.nan, dtype=float)
+    immediate_mask = immediate_prior_positions >= 0
+    immediate_prior_times.iloc[immediate_mask] = result_times[immediate_prior_positions[immediate_mask]]
+    immediate_prior_values[immediate_mask] = event_values[immediate_prior_positions[immediate_mask]]
+    events["immediate_previous_fcao"] = immediate_prior_values
+    events["immediate_previous_result_time"] = immediate_prior_times.to_numpy()
+
+    # The previous usable assay is the last recorded result strictly before the
+    # forecast issue time, not necessarily the immediately preceding event.
+    prior_positions = result_times.searchsorted(prediction_times, side="left") - 1
+    prior_mask = prior_positions >= 0
+    previous_values = np.full(len(events), np.nan, dtype=float)
+    previous_values[prior_mask] = event_values[prior_positions[prior_mask]]
+    previous_result_times = pd.Series(pd.NaT, index=events.index, dtype="datetime64[ns]")
+    previous_result_times.iloc[prior_mask] = result_times[prior_positions[prior_mask]]
+    events["previous_fcao"] = previous_values
+    events["previous_historian_observation_time"] = previous_result_times.to_numpy()
+    events["previous_fcao_age_minutes_at_result"] = (
+        pd.Series(result_times, index=events.index)
+        - events["immediate_previous_result_time"]
+    ).dt.total_seconds() / 60.0
+    events["previous_fcao_available_at_prediction_time"] = (
+        events["previous_historian_observation_time"].notna()
+        & (events["previous_historian_observation_time"] < events.index)
+    )
+    events["previous_fcao_age_minutes_at_prediction"] = (
+        pd.Series(events.index, index=events.index)
+        - events["previous_historian_observation_time"]
+    ).dt.total_seconds() / 60.0
+    events["time_semantics"] = (
+        "process_production_time_unknown; sample_time_unknown; "
+        "laboratory_result_available_time_unknown; historian_observation_time_is_not_a_production_or_sample_time"
+    )
+    legacy_late = events["immediate_previous_result_time"].notna() & (
+        events["immediate_previous_result_time"] > events.index
+    )
+    strict_unavailable = events["immediate_previous_result_time"].notna() & (
+        events["immediate_previous_result_time"] >= events.index
+    )
+    meta = {
+        "event_count_including_first": int(len(events)),
+        "event_count_with_previous_result": int(events["previous_fcao"].notna().sum()),
+        "prediction_horizon_minutes": int(prediction_horizon_minutes),
+        "process_production_time": "unknown",
+        "sample_time": "unknown",
+        "laboratory_result_available_time": "unknown",
+        "historian_observation_time": "observed source timestamp only; not labeled as production or sample time",
+        "previous_value_rule": "last actual assay-value-change event with historian_observation_time strictly before prediction_time",
+        "immediate_previous_late_than_legacy_60m_events": int(legacy_late.sum()),
+        "immediate_previous_not_strictly_available_events": int(strict_unavailable.sum()),
+        "reassigned_to_earlier_available_result_events": int(
+            (prior_mask & immediate_mask & (prior_positions != immediate_prior_positions)).sum()
+        ),
+        "events_without_available_previous_result": int((~prior_mask).sum()),
+    }
+    return events, meta
+
+
+def feature_delay_group(column: str) -> str:
+    base = column.split("__", 1)[0]
+    for group, columns in FEATURE_DELAY_GROUPS.items():
+        if base in columns:
+            return group
+    raise AssertionError(f"特征未登记延迟组: {column}")
+
+
+def build_group_delayed_features(
+    features: pd.DataFrame,
+    prediction_times: pd.Index,
+    group_delays_minutes: dict[str, int],
+) -> pd.DataFrame:
+    """Align each feature group to its own causal source time."""
+    prediction_index = pd.DatetimeIndex(prediction_times, name="prediction_time")
+    columns_by_group: dict[str, list[str]] = {}
+    for column in features.columns:
+        group = feature_delay_group(column)
+        columns_by_group.setdefault(group, []).append(column)
+    parts: list[pd.DataFrame] = []
+    for group, columns in columns_by_group.items():
+        delay = int(group_delays_minutes.get(group, 0))
+        requested = prediction_index - pd.Timedelta(minutes=delay)
+        part = features[columns].reindex(
+            requested, method="pad", tolerance=pd.Timedelta("1min")
+        )
+        part.index = prediction_index
+        parts.append(part)
+    return pd.concat(parts, axis=1).reindex(columns=features.columns)
+
+
+def fcao_delay_candidates(cfg: dict[str, Any]) -> dict[str, list[int]]:
+    configured = cfg.get("fcao_delay_candidates_minutes", {})
+    candidates: dict[str, list[int]] = {}
+    for group, defaults in DEFAULT_FCAO_DELAY_CANDIDATES.items():
+        values = configured.get(group, defaults)
+        parsed = sorted({int(value) for value in values})
+        if not parsed or any(value < 0 for value in parsed):
+            raise ValueError(f"游离钙延迟候选无效: {group}")
+        candidates[group] = parsed
+    return candidates
+
+
+def select_fcao_group_delays(
+    features: pd.DataFrame,
+    events: pd.DataFrame,
+    train_index: pd.Index,
+    cfg: dict[str, Any],
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """Select process-group delays using only a chronological inner calibration."""
+    candidates = fcao_delay_candidates(cfg)
+    ordered = pd.DatetimeIndex(train_index).sort_values()
+    if len(ordered) < 10:
+        defaults = {group: values[0] for group, values in candidates.items()}
+        return defaults, {
+            "status": "fallback_insufficient_inner_calibration",
+            "selection_train_rows": int(len(ordered)),
+            "selection_calibration_rows": 0,
+            "selection_test_rows": 0,
+            "selected_delays_minutes": defaults,
+            "candidates_minutes": candidates,
+            "lab_release": "observed_prior_only_not_tunable",
+        }
+    split = max(1, int(len(ordered) * 0.70))
+    fit_index = ordered[:split]
+    calibration_index = ordered[split:]
+    selected = {group: values[0] for group, values in candidates.items()}
+    evidence: dict[str, Any] = {
+        "status": "selected_on_inner_train_calibration",
+        "selection_train": sample_metadata(fit_index, events["fcao"]),
+        "selection_calibration": sample_metadata(calibration_index, events["fcao"]),
+        "selection_test_rows": 0,
+        "candidates_minutes": candidates,
+        "groups": {},
+        "lab_release": {
+            "selected_delay_minutes": None,
+            "candidates": ["observed_prior_only"],
+            "selection_method": "not_tunable; use strict prior historian observation before prediction_time",
+        },
+    }
+    for group, values in candidates.items():
+        candidate_scores: dict[str, float] = {}
+        for candidate in values:
+            trial = {**selected, group: candidate}
+            x = build_group_delayed_features(features, events.index, trial)
+            x["previous_fcao"] = events["previous_fcao"]
+            fit_ok = x.loc[fit_index].notna().any(axis=1) & events.loc[fit_index, "fcao"].notna()
+            calibration_ok = x.loc[calibration_index].notna().any(axis=1) & events.loc[
+                calibration_index, "fcao"
+            ].notna()
+            if fit_ok.sum() < 5 or calibration_ok.sum() == 0:
+                continue
+            model = regression_pipeline(alpha=10.0)
+            model.fit(x.loc[fit_index[fit_ok]], events.loc[fit_index[fit_ok], "fcao"])
+            pred = model.predict(x.loc[calibration_index[calibration_ok]])
+            candidate_scores[str(candidate)] = float(
+                mean_absolute_error(events.loc[calibration_index[calibration_ok], "fcao"], pred)
+            )
+        if candidate_scores:
+            best = min(candidate_scores, key=candidate_scores.get)
+            selected[group] = int(best)
+        evidence["groups"][group] = {
+            "selected_delay_minutes": int(selected[group]),
+            "candidate_calibration_mae": candidate_scores,
+            "selection_uses": "inner_train_calibration_only",
+        }
+    evidence["selected_delays_minutes"] = selected
+    return selected, evidence
 
 
 def assert_no_time_overlap(
@@ -495,6 +840,72 @@ def sample_metadata(
     return result
 
 
+def time_alignment_contract(
+    cfg: dict[str, Any], selected_fcao_delays: dict[str, int] | None = None
+) -> dict[str, Any]:
+    windows = [int(window) for window in cfg["feature_windows_minutes"]]
+    start = int(cfg["temperature_future_start_minutes"])
+    end = int(cfg["temperature_future_end_minutes"])
+    state_horizon = int(cfg["kiln_state_horizon_minutes"])
+    state_start = int(cfg.get("kiln_state_label_start_minutes", start))
+    state_end = int(cfg.get("kiln_state_label_end_minutes", end))
+    fcao_horizon = int(
+        cfg.get("fcao_prediction_horizon_minutes", cfg.get("fcao_process_delay_minutes", 60))
+    )
+    delays = selected_fcao_delays or {
+        group: values[0] for group, values in fcao_delay_candidates(cfg).items()
+    }
+    reported_delays: dict[str, Any] = {**delays, "lab_release": "observed_prior_only"}
+    return {
+        "minute_bucket": {
+            "bucket_start": "raw time floored to minute",
+            "bucket_end": "bucket_start + 1 minute; half-open bucket [bucket_start, bucket_end)",
+            "prediction_time": "bucket_end; minute process means are usable only at or after bucket_end",
+            "index_name": "prediction_time",
+        },
+        "secondary_air_temperature": {
+            "prediction_time": "minute prediction_time",
+            "feature_window": f"each rolling window uses prediction_time-{max(windows) - 1}m through prediction_time",
+            "target_window": f"prediction_time+{start}m through prediction_time+{end}m inclusive",
+            "result_availability": "all target minute values must be non-null; bucket means available at their bucket_end",
+        },
+        "secondary_air_trend": {
+            "prediction_time": "minute prediction_time",
+            "feature_window": f"each rolling window uses prediction_time-{max(windows) - 1}m through prediction_time",
+            "target_window": f"prediction_time+{start}m through prediction_time+{end}m inclusive versus prior 10-minute causal mean",
+            "result_availability": "inherits complete secondary-air-temperature target window requirement",
+        },
+        "kiln_state_center_30m": {
+            "prediction_time": "minute prediction_time",
+            "feature_window": f"each rolling window uses prediction_time-{max(windows) - 1}m through prediction_time",
+            "target_window": f"single label at prediction_time+{state_horizon}m",
+            "result_availability": "center label must be observed after the target timestamp",
+        },
+        "kiln_state_window": {
+            "prediction_time": "minute prediction_time",
+            "feature_window": f"each rolling window uses prediction_time-{max(windows) - 1}m through prediction_time",
+            "target_window": f"prediction_time+{state_start}m through prediction_time+{state_end}m inclusive",
+            "result_availability": "all target labels must be non-null",
+            "window_label_rule": cfg.get("kiln_state_window_rule", "minimum_over_window"),
+            "site_approval": "not_claimed",
+        },
+        "fcao_event": {
+            "prediction_time": f"target_event_time-{fcao_horizon}m",
+            "feature_window": {
+                group: (
+                    f"prediction_time-{delay}m and its causal rolling history"
+                    if isinstance(delay, int)
+                    else str(delay)
+                )
+                for group, delay in reported_delays.items()
+            },
+            "target_window": "single free-CaO actual value-change event at target_event_time",
+            "result_availability": "laboratory_result_available_time unknown; historian_observation_time used only as a conservative observed-availability boundary",
+            "previous_fcao": "last actual assay result with historian_observation_time strictly before prediction_time",
+        },
+    }
+
+
 def weekly_periods(index: pd.Index) -> list[pd.Period]:
     periods = pd.PeriodIndex(pd.DatetimeIndex(index).to_period("W-SUN")).unique()
     return list(periods.sort_values())
@@ -509,6 +920,7 @@ def weekly_regression_validation(
     stride: int,
     alpha: float,
     min_train_weeks: int,
+    feature_factory: Any | None = None,
 ) -> dict[str, Any]:
     valid_index = pd.DatetimeIndex(target.index[valid & target.notna() & baseline.notna()]).sort_values()
     folds: list[dict[str, Any]] = []
@@ -522,9 +934,16 @@ def weekly_regression_validation(
             continue
         assert_no_time_overlap(train_index[::stride], pd.DatetimeIndex([]), test_index, horizon_minutes)
         train_fit_index = train_index[::stride]
+        if feature_factory is None:
+            fold_features = features
+            cluster_meta = {"status": "not_refit_in_this_validation_call"}
+        else:
+            fold_features, cluster_meta = feature_factory(
+                test_start - pd.Timedelta(minutes=horizon_minutes)
+            )
         model = regression_pipeline(alpha=alpha)
-        model.fit(features.loc[train_fit_index], target.loc[train_fit_index])
-        model_pred = model.predict(features.loc[test_index])
+        model.fit(fold_features.loc[train_fit_index], target.loc[train_fit_index])
+        model_pred = model.predict(fold_features.loc[test_index])
         model_metrics = regression_metrics(target.loc[test_index], model_pred)
         baseline_metrics = regression_metrics(target.loc[test_index], baseline.loc[test_index].to_numpy())
         folds.append(
@@ -537,6 +956,12 @@ def weekly_regression_validation(
                 "baseline": baseline_metrics,
                 "model": model_metrics,
                 "model_beats_baseline": bool(model_metrics["mae"] < baseline_metrics["mae"]),
+                "cluster_fit": cluster_meta.get("cluster_fit", cluster_meta)
+                if isinstance(cluster_meta, dict)
+                else cluster_meta,
+                "delay_selection": cluster_meta.get("delay_selection")
+                if isinstance(cluster_meta, dict)
+                else None,
             }
         )
     model_mae = [fold["model"]["mae"] for fold in folds]
@@ -569,6 +994,7 @@ def weekly_classification_validation(
     labels: list[int],
     baseline: pd.Series | None = None,
     risk_label: int | None = None,
+    feature_factory: Any | None = None,
 ) -> dict[str, Any]:
     valid_index = pd.DatetimeIndex(target.index[valid & target.notna()]).sort_values()
     if baseline is not None:
@@ -595,9 +1021,16 @@ def weekly_classification_validation(
             )
             continue
         assert_no_time_overlap(train_fit_index, pd.DatetimeIndex([]), test_index, horizon_minutes)
+        if feature_factory is None:
+            fold_features = features
+            cluster_meta = {"status": "not_refit_in_this_validation_call"}
+        else:
+            fold_features, cluster_meta = feature_factory(
+                test_start - pd.Timedelta(minutes=horizon_minutes)
+            )
         model = classification_pipeline()
-        model.fit(features.loc[train_fit_index], target.loc[train_fit_index].astype(int))
-        model_pred = model.predict(features.loc[test_index])
+        model.fit(fold_features.loc[train_fit_index], target.loc[train_fit_index].astype(int))
+        model_pred = model.predict(fold_features.loc[test_index])
         model_metrics = classification_metrics(target.loc[test_index].astype(int), model_pred, labels, risk_label)
         if baseline is None:
             majority = int(target.loc[train_fit_index].mode().iloc[0])
@@ -620,6 +1053,12 @@ def weekly_classification_validation(
                 "baseline": baseline_metrics,
                 "model": model_metrics,
                 "model_beats_baseline": bool(model_metrics["macro_f1"] > baseline_metrics["macro_f1"]),
+                "cluster_fit": cluster_meta.get("cluster_fit", cluster_meta)
+                if isinstance(cluster_meta, dict)
+                else cluster_meta,
+                "delay_selection": cluster_meta.get("delay_selection")
+                if isinstance(cluster_meta, dict)
+                else None,
             }
         )
     completed = [fold for fold in folds if fold.get("status") != "skipped_insufficient_train_classes"]
@@ -647,18 +1086,27 @@ def fit_time_series_models(
     cfg: dict[str, Any],
     output_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], pd.DataFrame]:
+    assert_minute_time_contract(minute)
+    rolling_feature_factory = make_rolling_feature_factory(minute, cfg)
     start = int(cfg["temperature_future_start_minutes"])
     end = int(cfg["temperature_future_end_minutes"])
     future_temp = future_window_aggregate(minute["二次风温"], start, end, "mean")
     recent_temp = minute["二次风温"].rolling(10, min_periods=5).mean()
+    future_temp_all_valid = future_window_all_valid(minute["二次风温"].notna(), start, end)
+    future_stable_all = future_window_all_valid(stable, start, end)
     delta_temp = future_temp - recent_temp
     deadband = float(cfg["temperature_trend_deadband_c"])
     temp_trend = pd.Series(np.nan, index=minute.index, dtype="float64")
     temp_trend.loc[delta_temp.notna()] = np.select(
         [delta_temp < -deadband, delta_temp > deadband], [0, 2], default=1
     )[delta_temp.notna()]
-    future_stable = stable.shift(-end).fillna(False).astype(bool)
-    valid_temp = stable & future_stable & future_temp.notna() & recent_temp.notna()
+    valid_temp = (
+        stable
+        & future_stable_all
+        & future_temp_all_valid
+        & future_temp.notna()
+        & recent_temp.notna()
+    )
     train_mask, val_mask, test_mask, split_meta = time_split_masks(valid_temp, end)
     stride = int(cfg["train_stride_minutes"])
     train_rows = np.flatnonzero(train_mask.to_numpy())[::stride]
@@ -682,10 +1130,12 @@ def fit_time_series_models(
     temp_metrics["test_end"] = str(minute.index[test_rows[-1]])
     temp_metrics["target_definition"] = {
         "name": "future_secondary_air_temperature_mean",
+        "prediction_time": "minute index; equal to bucket_end",
         "window_start_minutes": start,
         "window_end_minutes": end,
-        "formula": "mean(y[t+25:t+35])",
-        "eligibility": "stable_at_t_and_at_window_end",
+        "formula": "mean(y[prediction_time+25m:prediction_time+35m])",
+        "eligibility": "stable_at_prediction_time_and_all_target_minutes; every_target_minute_nonnull",
+        "complete_window_required": True,
     }
     temp_metrics["primary_split"] = {
         **split_meta,
@@ -702,6 +1152,7 @@ def fit_time_series_models(
         stride,
         alpha=20.0,
         min_train_weeks=int(cfg.get("weekly_min_train_weeks", 4)),
+        feature_factory=rolling_feature_factory,
     )
 
     trend_valid = valid_temp & temp_trend.notna()
@@ -721,6 +1172,7 @@ def fit_time_series_models(
             "test_rows": int(len(trend_test_rows)),
             "target_definition": {
                 "name": "future_temperature_trend_vs_recent_10m_mean",
+                "prediction_time": "minute index; equal to bucket_end",
                 "window_start_minutes": start,
                 "window_end_minutes": end,
                 "deadband_c": deadband,
@@ -740,6 +1192,7 @@ def fit_time_series_models(
                 stride,
                 int(cfg.get("weekly_min_train_weeks", 4)),
                 labels=[0, 1, 2],
+                feature_factory=rolling_feature_factory,
             ),
         }
     )
@@ -749,6 +1202,9 @@ def fit_time_series_models(
     horizon = int(cfg["kiln_state_horizon_minutes"])
     state_start = int(cfg.get("kiln_state_label_start_minutes", start))
     state_end = int(cfg.get("kiln_state_label_end_minutes", end))
+    state_window_rule = str(cfg.get("kiln_state_window_rule", "minimum_over_window"))
+    if state_window_rule != "minimum_over_window":
+        raise ValueError("当前仅实现配置化窑况窗口规则 minimum_over_window")
     future_grade_worst = future_window_aggregate(mapped_grade, state_start, state_end, "min")
     future_grade_center = mapped_grade.shift(-horizon)
 
@@ -777,10 +1233,13 @@ def fit_time_series_models(
                 "target_definition": {
                     "name": label_name,
                     "class_mapping": {"0": "差", "1": "中", "2": "好"},
+                    "prediction_time": "minute index; equal to bucket_end",
                     "future_window_start_minutes": state_start if label_name == "window_worst" else None,
                     "future_window_end_minutes": state_end if label_name == "window_worst" else None,
                     "center_horizon_minutes": horizon if label_name == "center_30m" else None,
                     "aggregation": "minimum_over_future_window" if label_name == "window_worst" else "center_timestamp",
+                    "window_label_rule": state_window_rule if label_name == "window_worst" else None,
+                    "window_label_site_approval": "not_claimed",
                     "label_fill": "causal_ffill_after_minute_last_observation",
                 },
                 "primary_split": {
@@ -805,6 +1264,7 @@ def fit_time_series_models(
                     labels=[0, 1, 2],
                     baseline=mapped_grade,
                     risk_label=0,
+                    feature_factory=rolling_feature_factory,
                 ),
             }
         )
@@ -852,34 +1312,60 @@ def fit_fcao_models(
     cfg: dict[str, Any],
     output_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    fcao = minute["出窑熟料游离钙"]
-    event_series = extract_change_events(fcao)
-    events = pd.DataFrame({"fcao": event_series})
-    events["previous_fcao"] = events["fcao"].shift(1)
-    events["delta_fcao"] = events["fcao"] - events["previous_fcao"]
+    assert_minute_time_contract(minute)
+    prediction_horizon = int(
+        cfg.get("fcao_prediction_horizon_minutes", cfg.get("fcao_process_delay_minutes", 60))
+    )
+    all_events, event_alignment = build_fcao_event_table(minute, prediction_horizon)
     deadband = float(cfg["fcao_trend_deadband"])
-    events["trend"] = np.select(
-        [events["delta_fcao"] < -deadband, events["delta_fcao"] > deadband], [0, 2], default=1
+    all_events["delta_fcao"] = all_events["fcao"] - all_events["immediate_previous_fcao"]
+    all_events["trend"] = np.select(
+        [all_events["delta_fcao"] < -deadband, all_events["delta_fcao"] > deadband],
+        [0, 2],
+        default=1,
     )
-    delay = pd.Timedelta(minutes=int(cfg["fcao_process_delay_minutes"]))
-    feature_times = events.index - delay
-    # ``pad`` is deliberately used instead of nearest: nearest can select a
-    # minute after the causal feature time and leak future process values.
-    positions = features.index.get_indexer(
-        feature_times, method="pad", tolerance=pd.Timedelta("1min")
+    valid_previous = all_events["previous_fcao_available_at_prediction_time"] & all_events[
+        "previous_fcao"
+    ].notna()
+    events = all_events.loc[valid_previous].copy()
+    event_alignment["event_samples_after_causality_filter"] = int(len(events))
+    event_alignment["events_removed_without_previous_available_result"] = int((~valid_previous).sum())
+    if len(events) < 20:
+        raise ValueError("游离钙可用化验事件不足，无法进行时间对齐建模")
+    (output_dir / "fcao_event_alignment.csv").write_text(
+        all_events.reset_index().to_csv(index=False), encoding="utf-8"
     )
-    keep = positions >= 0
-    events = events.iloc[np.flatnonzero(keep)].copy()
-    positions = positions[keep]
-    x = features.iloc[positions].copy()
-    x.index = events.index
-    x["previous_fcao"] = events["previous_fcao"]
-    valid = events["previous_fcao"].notna()
-    events = events[valid]
-    x = x.loc[events.index]
-    assert_model_feature_contract(list(x.columns), allowed_extra={"previous_fcao"})
+
     valid_events = pd.Series(True, index=events.index)
     train_mask, validation_mask, test_mask, split_meta = time_split_masks(valid_events, 0)
+    train_index = events.index[train_mask.to_numpy()]
+    selected_delays, delay_selection = select_fcao_group_delays(features, events, train_index, cfg)
+    x = build_group_delayed_features(features, events.index, selected_delays)
+    x["previous_fcao"] = events["previous_fcao"]
+    assert_model_feature_contract(list(x.columns), allowed_extra={"previous_fcao"})
+
+    rolling_feature_factory = make_rolling_feature_factory(minute, cfg)
+    fcao_fold_cache: dict[pd.Timestamp, tuple[pd.DataFrame, dict[str, Any]]] = {}
+
+    def fcao_feature_factory(fit_end: pd.Timestamp) -> tuple[pd.DataFrame, dict[str, Any]]:
+        key = pd.Timestamp(fit_end)
+        if key not in fcao_fold_cache:
+            fold_features, cluster_meta = rolling_feature_factory(key)
+            fold_train_index = events.index[events.index < key]
+            fold_delays, fold_delay_selection = select_fcao_group_delays(
+                fold_features, events, fold_train_index, cfg
+            )
+            fold_x = build_group_delayed_features(fold_features, events.index, fold_delays)
+            fold_x["previous_fcao"] = events["previous_fcao"]
+            fcao_fold_cache[key] = (
+                fold_x,
+                {
+                    "cluster_fit": cluster_meta,
+                    "delay_selection": fold_delay_selection,
+                    "selected_delays_minutes": fold_delays,
+                },
+            )
+        return fcao_fold_cache[key]
 
     reg = regression_pipeline(alpha=10.0)
     reg.fit(x.loc[train_mask.index[train_mask]], events.loc[train_mask.index[train_mask], "fcao"])
@@ -895,8 +1381,12 @@ def fit_fcao_models(
     )
     reg_metrics["event_samples"] = int(len(events))
     reg_metrics["test_events"] = int(test_mask.sum())
-    reg_metrics["feature_time_alignment"] = "pad_at_event_time_minus_process_delay"
-    reg_metrics["process_delay_minutes"] = int(cfg["fcao_process_delay_minutes"])
+    reg_metrics["feature_time_alignment"] = "group_specific_pad_at_prediction_time_minus_selected_delay"
+    reg_metrics["prediction_time"] = "target_event_time_minus_prediction_horizon"
+    reg_metrics["prediction_horizon_minutes"] = prediction_horizon
+    reg_metrics["group_delays_minutes"] = selected_delays
+    reg_metrics["delay_selection"] = delay_selection
+    reg_metrics["time_alignment"] = event_alignment
     reg_metrics["event_definition"] = (
         "first_observed_value_and_subsequent_actual_value_changes_only"
     )
@@ -915,6 +1405,7 @@ def fit_fcao_models(
         1,
         alpha=10.0,
         min_train_weeks=int(cfg.get("weekly_min_train_weeks", 4)),
+        feature_factory=fcao_feature_factory,
     )
 
     cls = classification_pipeline()
@@ -928,9 +1419,12 @@ def fit_fcao_models(
     )
     cls_metrics.update(
         {
-            "process_delay_minutes": int(cfg["fcao_process_delay_minutes"]),
+            "prediction_horizon_minutes": prediction_horizon,
+            "group_delays_minutes": selected_delays,
             "event_definition": "previous_event_delta_with_deadband",
             "deadband": deadband,
+            "time_alignment": event_alignment,
+            "delay_selection": delay_selection,
             "primary_split": {
                 **split_meta,
                 "train": sample_metadata(train_mask.index[train_mask], events["trend"], categorical=True),
@@ -945,6 +1439,7 @@ def fit_fcao_models(
                 1,
                 int(cfg.get("weekly_min_train_weeks", 4)),
                 labels=[0, 1, 2],
+                feature_factory=fcao_feature_factory,
             ),
         }
     )
@@ -952,7 +1447,30 @@ def fit_fcao_models(
     joblib.dump(reg, output_dir / "models" / "fcao_regression.joblib")
     joblib.dump(cls, output_dir / "models" / "fcao_trend.joblib")
     joblib.dump(list(x.columns), output_dir / "models" / "fcao_feature_columns.joblib")
-    return {"fcao_regression": reg_metrics, "fcao_trend": cls_metrics}, {"reg": reg, "trend": cls}
+    (output_dir / "fcao_delay_alignment.json").write_text(
+        json.dumps(
+            to_jsonable(
+                {
+                    "prediction_horizon_minutes": prediction_horizon,
+                    "selected_delays_minutes": selected_delays,
+                    "delay_selection": delay_selection,
+                    "time_alignment": event_alignment,
+                }
+            ),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "fcao_regression": reg_metrics,
+        "fcao_trend": cls_metrics,
+    }, {
+        "reg": reg,
+        "trend": cls,
+        "group_delays_minutes": selected_delays,
+        "prediction_horizon_minutes": prediction_horizon,
+    }
 
 
 def model_promotion_status(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -1021,6 +1539,56 @@ def model_promotion_status(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compare_stage_a2_weekly_metrics(
+    reference_path: Path, current_metrics: dict[str, Any]
+) -> dict[str, Any]:
+    """Make an explicit pre/post fold comparison without changing evaluation scope."""
+    if not reference_path.exists():
+        return {"status": "reference_not_found", "reference_path": str(reference_path)}
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    tasks = [
+        ("secondary_air_temperature", "mae", "mae"),
+        ("secondary_air_trend", "macro_f1", "macro_f1"),
+        ("kiln_state", "macro_f1", "macro_f1"),
+        ("kiln_state_center", "macro_f1", "macro_f1"),
+        ("fcao_regression", "mae", "mae"),
+    ]
+    comparison: dict[str, Any] = {
+        "status": "complete",
+        "reference_path": str(reference_path.resolve()),
+        "interpretation": "before is the pre-A2 rolling implementation; after is the A2 implementation with fold-fitted clusters and explicit time anchors",
+        "tasks": {},
+    }
+    for task, model_metric, baseline_metric in tasks:
+        before_folds = reference.get(task, {}).get("weekly_rolling_validation", {}).get("folds", [])
+        after_folds = current_metrics.get(task, {}).get("weekly_rolling_validation", {}).get("folds", [])
+        before_by_fold = {int(fold["fold"]): fold for fold in before_folds if "model" in fold}
+        after_by_fold = {int(fold["fold"]): fold for fold in after_folds if "model" in fold}
+        fold_rows = []
+        for fold_number in sorted(set(before_by_fold) | set(after_by_fold)):
+            before = before_by_fold.get(fold_number)
+            after = after_by_fold.get(fold_number)
+            fold_rows.append(
+                {
+                    "fold": fold_number,
+                    "test_week_before": before.get("test_week") if before else None,
+                    "test_week_after": after.get("test_week") if after else None,
+                    "before_model": before.get("model", {}).get(model_metric) if before else None,
+                    "before_baseline": before.get("baseline", {}).get(baseline_metric) if before else None,
+                    "after_model": after.get("model", {}).get(model_metric) if after else None,
+                    "after_baseline": after.get("baseline", {}).get(baseline_metric) if after else None,
+                    "after_cluster_fit": after.get("cluster_fit") if after else None,
+                    "after_delay_selection": after.get("delay_selection") if after else None,
+                }
+            )
+        comparison["tasks"][task] = {
+            "before_summary": reference.get(task, {}).get("weekly_rolling_validation", {}).get("summary"),
+            "after_summary": current_metrics.get(task, {}).get("weekly_rolling_validation", {}).get("summary"),
+            "folds": fold_rows,
+        }
+    return comparison
+
+
 def objective_direction_for_prediction(
     predicted_temperature: float, target: float, deadband: float, promoted: bool
 ) -> str | None:
@@ -1079,8 +1647,17 @@ def latest_shadow_signal(
     objective_allowed = bool(validation_status.get("objective_direction_allowed", False))
     direction_signal = build_direction_signal(predicted_temp, target, deadband, objective_allowed)
 
-    previous_fcao = float(minute.loc[:latest_index, "出窑熟料游离钙"].dropna().iloc[-1])
-    fcao_x = x.copy()
+    prior_fcao_values = minute.loc[
+        minute.index < latest_index, "出窑熟料游离钙"
+    ].dropna()
+    if prior_fcao_values.empty:
+        raise ValueError("最新 prediction_time 之前没有可用游离钙化验结果")
+    previous_fcao = float(prior_fcao_values.iloc[-1])
+    fcao_x = build_group_delayed_features(
+        features,
+        pd.DatetimeIndex([latest_index], name="prediction_time"),
+        fcao_models.get("group_delays_minutes", {}),
+    )
     fcao_x["previous_fcao"] = previous_fcao
     predicted_fcao = float(fcao_models["reg"].predict(fcao_x)[0])
     fcao_trend = int(fcao_models["trend"].predict(fcao_x)[0])
@@ -1094,7 +1671,8 @@ def latest_shadow_signal(
         "predicted_kiln_state_25_to_35_min_worst": worst_name,
         "kiln_state_probabilities": center_probability_map,
         "kiln_state_probabilities_25_to_35_min_worst": worst_probability_map,
-        "predicted_fcao_after_configured_process_delay": predicted_fcao,
+        "predicted_fcao_at_configured_prediction_horizon": predicted_fcao,
+        "fcao_prediction_horizon_minutes": fcao_models.get("prediction_horizon_minutes"),
         "fcao_trend": {0: "下降", 1: "稳定", 2: "上升"}[fcao_trend],
         "objective_direction": direction_signal["objective_direction"],
         "actuator_recommendation": direction_signal["actuator_recommendation"],
@@ -1147,6 +1725,91 @@ def package_version(name: str) -> str | None:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def fisher_correlation_interval(correlation: float, sample_count: int) -> list[float] | None:
+    if sample_count <= 3 or not np.isfinite(correlation) or abs(correlation) >= 1:
+        return None
+    z = math.atanh(float(correlation))
+    margin = 1.96 / math.sqrt(sample_count - 3)
+    return [
+        float(math.tanh(z - margin)),
+        float(math.tanh(z + margin)),
+    ]
+
+
+def audit_inlet_chemistry_alignment(
+    minute: pd.DataFrame, output_dir: Path, candidate_step_minutes: int = 30
+) -> dict[str, Any]:
+    """Explore 0–12h outmill-to-inlet chemistry shifts without selecting one."""
+    assert_minute_time_contract(minute)
+    missing = sorted(
+        (set(INLET_CHEMISTRY_COLUMNS) | set(CHEMISTRY_EXPLANATION_COLUMNS))
+        - set(minute.columns)
+    )
+    if missing:
+        raise ValueError(f"入窑生料对齐审计缺少字段: {missing}")
+    rows: list[dict[str, Any]] = []
+    candidate_lags = list(range(0, 12 * 60 + 1, int(candidate_step_minutes)))
+    for component in ["KH", "SM", "IM"]:
+        outmill = minute[f"出磨生料{component}"].ffill()
+        inlet = minute[f"入窑生料{component}"].ffill()
+        for lag in candidate_lags:
+            aligned = pd.DataFrame(
+                {
+                    "outmill": outmill.shift(lag),
+                    "inlet": inlet,
+                },
+                index=minute.index,
+            ).dropna()
+            count = int(len(aligned))
+            pearson = float(aligned["outmill"].corr(aligned["inlet"])) if count >= 3 else float("nan")
+            spearman = (
+                float(aligned["outmill"].rank().corr(aligned["inlet"].rank()))
+                if count >= 3
+                else float("nan")
+            )
+            rows.append(
+                {
+                    "component": component,
+                    "lag_minutes": int(lag),
+                    "overlap_rows": count,
+                    "overlap_start": str(aligned.index.min()) if count else None,
+                    "overlap_end": str(aligned.index.max()) if count else None,
+                    "pearson_r": pearson if np.isfinite(pearson) else None,
+                    "pearson_ci95_fisher": fisher_correlation_interval(pearson, count),
+                    "spearman_r": spearman if np.isfinite(spearman) else None,
+                    "uncertainty_note": "Fisher-z interval treats minute rows as independent; serial correlation makes it optimistic",
+                }
+            )
+    audit_frame = pd.DataFrame(rows)
+    audit_frame.to_csv(output_dir / "inlet_chemistry_alignment_audit.csv", index=False, encoding="utf-8-sig")
+    peaks: dict[str, Any] = {}
+    for component, frame in audit_frame.groupby("component", sort=True):
+        usable = frame.dropna(subset=["pearson_r"])
+        best = usable.iloc[usable["pearson_r"].abs().argmax()] if not usable.empty else None
+        peaks[component] = (
+            {
+                "max_abs_pearson_lag_minutes": int(best["lag_minutes"]),
+                "max_abs_pearson_r": float(best["pearson_r"]),
+                "max_abs_pearson_ci95_fisher": best["pearson_ci95_fisher"],
+                "max_abs_pearson_overlap_rows": int(best["overlap_rows"]),
+            }
+            if best is not None
+            else None
+        )
+    return {
+        "status": "exploratory_only_not_used_to_set_residence_time",
+        "components": ["KH", "SM", "IM"],
+        "candidate_lags_minutes": candidate_lags,
+        "fill_for_audit": "causal_ffill_only; no bfill",
+        "outmill_columns": CHEMISTRY_EXPLANATION_COLUMNS,
+        "inlet_columns": INLET_CHEMISTRY_COLUMNS,
+        "peaks_by_component": peaks,
+        "interpretation": "约450分钟附近的相关性峰只能作为候选时移证据，不能直接解释为真实停留时间或生产时延。",
+        "uncertainty": "Fisher-z 95%区间仅为探索性不确定性，未校正分钟序列自相关；样本重叠区间逐折不用于模型调参。",
+        "evidence_file": str((output_dir / "inlet_chemistry_alignment_audit.csv").resolve()),
+    }
 
 
 def audit_source_provenance(data_path: Path) -> dict[str, Any]:
@@ -1209,6 +1872,7 @@ def write_run_manifest(
     data_summary: dict[str, Any],
     feature_columns: list[str],
     cluster_meta: dict[str, Any],
+    alignment_contract: dict[str, Any],
     promotion_status: dict[str, Any],
     started_at: float,
 ) -> None:
@@ -1232,7 +1896,7 @@ def write_run_manifest(
         if path.is_file() and path.resolve() != manifest_path.resolve()
     ]
     manifest = {
-        "stage": "A",
+        "stage": "A2",
         "status": "REVIEW_REQUIRED",
         "run_id": output_dir.parent.name,
         "started_at_epoch": started_at,
@@ -1266,7 +1930,11 @@ def write_run_manifest(
             "fcao_history_columns": ["previous_fcao"],
             "forbidden_fields": sorted(set(FORBIDDEN_FEATURE_FIELDS)),
             "feature_count": int(len(feature_columns)),
+            "delay_groups": {
+                group: sorted(columns) for group, columns in FEATURE_DELAY_GROUPS.items()
+            },
         },
+        "time_alignment_contract": alignment_contract,
         "cluster_fit": cluster_meta,
         "data_summary": data_summary,
         "source_provenance_audit": audit,
@@ -1343,8 +2011,17 @@ def main() -> None:
 
     minute = load_or_build_minutes(cfg, output_dir)
     minute = minute.sort_index()
+    assert_minute_time_contract(minute)
+    inlet_alignment_audit = audit_inlet_chemistry_alignment(
+        minute,
+        output_dir,
+        candidate_step_minutes=int(cfg.get("inlet_chemistry_alignment_step_minutes", 30)),
+    )
     stable = stable_mask(minute)
-    print(f"一分钟记录: {len(minute):,}; 稳定工况: {stable.sum():,} ({stable.mean():.1%})")
+    print(
+        f"一分钟记录: {len(minute):,}; 稳定工况: {stable.sum():,} ({stable.mean():.1%}); "
+        f"prediction_time={minute.index.min()}..{minute.index.max()}"
+    )
 
     print("拟合原料成分聚类……")
     ordered_index = pd.DatetimeIndex(minute.index).sort_values()
@@ -1369,6 +2046,11 @@ def main() -> None:
         "forbidden_fields": sorted(set(FORBIDDEN_FEATURE_FIELDS)),
         "missing_handling": "model_pipeline_training_median_imputer",
         "rolling_window_causality": "current_and_prior_rows_only",
+        "time_anchor_columns": TIME_ANCHOR_COLUMNS,
+        "prediction_time_definition": "bucket_end",
+        "delay_groups": {
+            group: sorted(columns) for group, columns in FEATURE_DELAY_GROUPS.items()
+        },
     }
     (output_dir / "feature_contract.json").write_text(
         json.dumps(to_jsonable(feature_contract), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1382,7 +2064,23 @@ def main() -> None:
 
     print("训练游离钙事件模型……")
     fcao_metrics, fcao_models = fit_fcao_models(minute, features, cfg, output_dir)
-    metrics = {**time_metrics, **fcao_metrics, "material_clustering": cluster_meta}
+    alignment_contract = time_alignment_contract(cfg, fcao_models["group_delays_minutes"])
+    metrics = {
+        **time_metrics,
+        **fcao_metrics,
+        "material_clustering": cluster_meta,
+        "time_alignment_contract": alignment_contract,
+        "inlet_chemistry_alignment_audit": inlet_alignment_audit,
+    }
+    reference_path_value = cfg.get("pre_a2_reference_metrics_path")
+    if reference_path_value:
+        comparison = compare_stage_a2_weekly_metrics(
+            Path(str(reference_path_value)), metrics
+        )
+        metrics["stage_a2_pre_post_comparison"] = comparison
+        (output_dir / "stage_a2_pre_post_comparison.json").write_text(
+            json.dumps(to_jsonable(comparison), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     promotion_status = model_promotion_status(metrics)
 
     signal = latest_shadow_signal(
@@ -1393,12 +2091,21 @@ def main() -> None:
         "minute_rows": int(len(minute)),
         "start": str(minute.index.min()),
         "end": str(minute.index.max()),
+        "bucket_start_min": str(minute["bucket_start"].min()),
+        "bucket_end_max": str(minute["bucket_end"].max()),
+        "prediction_time_min": str(minute["prediction_time"].min()),
+        "prediction_time_max": str(minute["prediction_time"].max()),
         "stable_minutes": int(stable.sum()),
         "stable_fraction": float(stable.mean()),
         "feature_count": int(features.shape[1]),
         "material_clusters": int(cluster_meta["selected_k"]),
         "kiln_label_nonnull_minutes": int(minute["窑况等级"].notna().sum()),
         "fcao_change_events_after_initial": int(fcao_metrics["fcao_regression"]["event_samples"]),
+        "fcao_events_without_previous_available_result": int(
+            fcao_metrics["fcao_regression"]["time_alignment"][
+                "events_without_available_previous_result"
+            ]
+        ),
     }
     (output_dir / "metrics.json").write_text(
         json.dumps(to_jsonable(metrics), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1427,6 +2134,7 @@ def main() -> None:
         data_summary,
         list(features.columns),
         cluster_meta,
+        alignment_contract,
         promotion_status,
         started_at,
     )

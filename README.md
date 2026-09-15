@@ -43,6 +43,10 @@ python3 -m venv --system-site-packages .venv && .venv/bin/python -m pip install 
 - `predictions_tail.csv`：测试集末尾预测；
 - `models/*.joblib`：模型及预处理器；
 - `minute_cache.parquet`：一分钟聚合缓存；
+- `fcao_event_alignment.csv`：游离钙真实变化事件与预测时刻对齐明细；
+- `fcao_delay_alignment.json`：游离钙分组延迟候选、训练期选择和可用性规则；
+- `inlet_chemistry_alignment_audit.csv`：出磨到入窑 KH/SM/IM 的探索性时移相关性审计；
+- `stage_a2_pre_post_comparison.json`：时间对齐整改前后按周逐折指标对照；
 - 运行目录中的 `run_manifest.json`：源码/配置/输入哈希、环境、特征清单和生成文件清单。
 
 ## 安全边界
@@ -50,8 +54,10 @@ python3 -m venv --system-site-packages .venv && .venv/bin/python -m pip install 
 - `latest_shadow_signal.json` 只给出“二次风温需要升高/保持/降低”的目标方向，不把相关性模型包装成设备控制策略。
 - 在完成受约束模型辨识、反事实验证和现场审批前，不输出煤量、窑速、风机的实际调节值。
 - 模型指标只采用严格时间切分和按周滚动测试；训练边界按目标最长窗口留出 purge 间隔，禁止随机行切分。
+- 一分钟桶定义为 `[bucket_start, bucket_end)`；过程均值只在 `bucket_end` 后使用，`prediction_time` 等于 `bucket_end`，未来窗口从 `prediction_time` 计算。
 - 原料聚类的缺失处理、缩放器和聚类中心只在训练期拟合，成分只允许因果 `ffill`，不使用 `bfill`。
-- 游离钙以真实值变化事件为样本，不把向前填充的分钟或 5 秒记录当作独立标签；事件特征用延迟后的 `pad` 对齐，不向未来取最近值。
+- 游离钙以真实值变化事件为样本，不把向前填充的分钟或 5 秒记录当作独立标签；上一化验值必须严格早于 `prediction_time`，事件特征按变量组独立选择延迟并用因果 `pad` 对齐，不向未来取最近值。
+- 游离钙的生产时间、取样时间和实验室结果可用时间在当前数据中均标记为未知；historian 观测时间不被解释为生产或取样时间。
 - `窑况日志`、窑况/趋势标签、RTO 推荐和目标派生字段不进入基础特征；窑况标签保留日志/规则衍生疑点。
-- 窑况同时输出 30 分钟中心时刻和 25–35 分钟窗口最差两种标签评估，信号字段分别标明，不混用。
+- 窑况同时输出 30 分钟中心时刻和 25–35 分钟配置化窗口规则标签，当前窗口规则未声称获得现场认可，信号字段分别标明，不混用。
 - 模型未通过滚动验收时，目标方向信号为 `null`，执行器建议始终为 `null`。

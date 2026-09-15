@@ -13,7 +13,15 @@
   "kiln_state_horizon_minutes": 30,
   "kiln_state_label_start_minutes": 25,
   "kiln_state_label_end_minutes": 35,
+  "kiln_state_window_rule": "minimum_over_window",
+  "inlet_chemistry_alignment_step_minutes": 30,
+  "fcao_prediction_horizon_minutes": 60,
   "fcao_process_delay_minutes": 60,
+  "fcao_delay_candidates_minutes": {
+    "outmill_chemistry": [0, 30, 60, 90, 120, 180, 240, 300, 360, 450],
+    "preheater_calciner_kiln": [0, 15, 30, 45, 60, 90, 120],
+    "kiln_head_grate_cooler": [0, 15, 30, 45, 60, 90, 120]
+  },
   "fcao_trend_deadband": 0.05,
   "train_stride_minutes": 5,
   "weekly_min_train_weeks": 4
