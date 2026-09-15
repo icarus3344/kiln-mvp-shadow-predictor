@@ -23,15 +23,13 @@ cp config.example.json config.json
 .venv/bin/python src/kiln_mvp.py --config config.json
 ```
 
-从干净环境复现阶段 A 的单一命令：
+从干净环境运行的单一命令：
 
 ```bash
 python3 -m venv --system-site-packages .venv && .venv/bin/python -m pip install -r requirements.txt && cp config.example.json config.json && .venv/bin/python src/kiln_mvp.py --config config.json
 ```
 
 运行前先将 `config.example.json` 复制为本机配置 `config.json`，并将 `data_path` 指向本地只读 Parquet；`config.json` 不纳入版本库。原始文件必须保持只读。
-
-GitHub 同步边界：仓库只包含可复现的代码、测试、说明和配置模板；原始 Parquet、虚拟环境、缓存、模型、报告和 `runs/` 实验目录均不上传。
 
 ## 输出
 
@@ -44,7 +42,7 @@ GitHub 同步边界：仓库只包含可复现的代码、测试、说明和配�
 - `material_cluster_profiles.csv`：原料聚类中心画像；
 - `predictions_tail.csv`：测试集末尾预测；
 - `models/*.joblib`：模型及预处理器；
-- `minute_cache.parquet`：一分钟数据缓存，后续运行会复用；
+- `minute_cache.parquet`：一分钟聚合缓存；
 - 运行目录中的 `run_manifest.json`：源码/配置/输入哈希、环境、特征清单和生成文件清单。
 
 ## 安全边界
@@ -57,13 +55,3 @@ GitHub 同步边界：仓库只包含可复现的代码、测试、说明和配�
 - `窑况日志`、窑况/趋势标签、RTO 推荐和目标派生字段不进入基础特征；窑况标签保留日志/规则衍生疑点。
 - 窑况同时输出 30 分钟中心时刻和 25–35 分钟窗口最差两种标签评估，信号字段分别标明，不混用。
 - 模型未通过滚动验收时，目标方向信号为 `null`，执行器建议始终为 `null`。
-
-## Luna 后续实施顺序
-
-1. 先复跑当前基线并固定数据质量报告；
-2. 加入 LightGBM/CatBoost，与 Ridge/逻辑回归做同一时间测试；
-3. 增加滚动回测、按原料聚类分组指标和概率校准；
-4. 建立操纵量到预测目标的动态响应模型；
-5. 只在历史安全范围内做候选方向搜索；
-6. 增加本地 API/仪表板和定时推理；
-7. 影子运行通过后，再讨论人工确认式推荐。
