@@ -1,0 +1,7 @@
+numpy>=2.0
+pandas>=2.2
+pyarrow>=20
+scipy>=1.14
+scikit-learn>=1.6
+joblib>=1.4
+

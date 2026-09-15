@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local data and machine-specific configuration.
+*.parquet
+config.json
+LUNA_MASTER_PROMPT.md
+
+# Generated reports, caches, models, and experiment runs.
+artifacts/
+runs/
+

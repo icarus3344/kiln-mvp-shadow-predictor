@@ -1,0 +1,20 @@
+{
+  "data_path": "data/chaohuConch1_2025_01_06.parquet",
+  "output_dir": "artifacts",
+  "reuse_minute_cache": true,
+  "random_seed": 20260915,
+  "cluster_k_min": 3,
+  "cluster_k_max": 6,
+  "feature_windows_minutes": [10, 30, 60],
+  "temperature_future_start_minutes": 25,
+  "temperature_future_end_minutes": 35,
+  "temperature_trend_deadband_c": 7.0,
+  "secondary_air_target_c": 1100.0,
+  "kiln_state_horizon_minutes": 30,
+  "kiln_state_label_start_minutes": 25,
+  "kiln_state_label_end_minutes": 35,
+  "fcao_process_delay_minutes": 60,
+  "fcao_trend_deadband": 0.05,
+  "train_stride_minutes": 5,
+  "weekly_min_train_weeks": 4
+}
